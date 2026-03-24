@@ -1234,7 +1234,8 @@
       startedAt: Date.now(),
       firstTokenAt: null,
       hasThink: false,
-      thinkElapsed: null
+      thinkElapsed: null,
+      thinkingActive: false
     };
     return entry;
   }
@@ -1535,8 +1536,9 @@
       restoreScrollState(entry.contentNode, '.think-rollout-body', savedThinkRolloutBodyScroll);
     }
     if (entry.hasThink) {
+      entry.thinkingActive = !finalize;
       if (finalize && (entry.thinkElapsed === null || typeof entry.thinkElapsed === 'undefined')) {
-        entry.thinkElapsed = 0;
+        entry.thinkElapsed = Math.max(1, Math.round((Date.now() - (entry.startedAt || Date.now())) / 1000));
       }
       updateThinkSummary(entry, entry.thinkElapsed);
     }
@@ -1612,7 +1614,7 @@
       node.textContent = text;
       const block = node.closest('.think-block');
       if (!block) return;
-      if (typeof elapsedSec === 'number') {
+      if (!entry.thinkingActive) {
         block.removeAttribute('data-thinking');
         node.style.removeProperty('--think-spin-delay');
         block.querySelectorAll('.think-agent summary').forEach((summary) => {
@@ -2639,6 +2641,7 @@
               }
               if (!assistantEntry.hasThink && assistantText.includes('<think>')) {
                 assistantEntry.hasThink = true;
+                assistantEntry.thinkingActive = true;
                 assistantEntry.thinkElapsed = null;
                 updateThinkSummary(assistantEntry, null);
               }

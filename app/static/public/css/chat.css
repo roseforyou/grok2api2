@@ -848,6 +848,10 @@ body {
   content: "";
   width: 20px;
   height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 20px;
   border-radius: 50%;
   background: conic-gradient(from 180deg, #f59e0b, #f97316, #22c55e, #0ea5e9, #f59e0b);
   border: 1px solid #fff;
