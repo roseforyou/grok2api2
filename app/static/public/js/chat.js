@@ -137,6 +137,7 @@
       const text = getMessageDisplay(msg);
       const entry = createMessage(msg.role, text);
       if (entry && msg.role === 'assistant') {
+        entry.sources = msg.sources || null;
         updateMessage(entry, text, true);
       }
     }
@@ -572,9 +573,189 @@
     });
   }
 
+  function getInlineCitationLabel(link) {
+    if (!link || typeof link !== 'object') return '';
+    const hostname = normalizeSourceText(link.hostname || getSourceHostname(link.href || ''));
+    if (hostname) return hostname;
+    const label = normalizeSourceText(link.label || '');
+    if (label) return label;
+    return normalizeSourceText(link.href || '');
+  }
+
+  function buildInlineCitationChip(links) {
+    const items = Array.isArray(links) ? links.filter(Boolean) : [];
+    if (!items.length) return '';
+    const first = items[0];
+    const href = escapeHtml(String(first.href || '').trim());
+    const label = escapeHtml(getInlineCitationLabel(first));
+    if (!href || !label) return '';
+    const extraCount = items.length - 1;
+    const titles = items
+      .map((item) => normalizeSourceText(item.label || item.hostname || item.href || ''))
+      .filter(Boolean);
+    const titleAttr = titles.length ? ` title="${escapeHtml(titles.join('\n'))}"` : '';
+    return `<span class="inline print-hidden"><span class="inline"><a href="${href}" target="_blank" rel="noopener noreferrer nofollow" class="citation inline-citation-chip no-copy inline text-nowrap print-hidden"${titleAttr} data-state="closed"><span class="inline-citation-chip__label">${label}</span>${extraCount > 0 ? `<span class="inline-citation-chip__count">+${extraCount}</span>` : ''}</a></span></span>`;
+  }
+
+  function renderInlineCitationTokens(value, htmlLinks) {
+    return value.replace(/(?:@@HTMLLINK_\d+@@(?:\s|&nbsp;|\u00a0|\u2060)*)+/g, (match) => {
+      const indices = Array.from(match.matchAll(/@@HTMLLINK_(\d+)@@/g))
+        .map((part) => Number(part[1]))
+        .filter((index) => Number.isFinite(index));
+      const links = [];
+      const seen = new Set();
+      indices.forEach((index) => {
+        const item = htmlLinks[index];
+        const href = String(item && item.href || '').trim();
+        if (!href || seen.has(href)) return;
+        seen.add(href);
+        links.push(item);
+      });
+      if (!links.length) return '';
+      const grouped = [];
+      let currentGroup = [];
+      let currentKey = '';
+      links.forEach((item) => {
+        const key = normalizeSourceText(item.hostname || item.href || '');
+        if (!currentGroup.length || key === currentKey) {
+          currentGroup.push(item);
+          currentKey = key;
+          return;
+        }
+        grouped.push(currentGroup);
+        currentGroup = [item];
+        currentKey = key;
+      });
+      if (currentGroup.length) grouped.push(currentGroup);
+      return grouped.map((group) => buildInlineCitationChip(group)).join('');
+    });
+  }
+
+  function buildStructuredSourceCandidates(sources) {
+    const candidates = [];
+    const seen = new Set();
+    const citations = Array.isArray(sources && sources.citations) ? sources.citations : [];
+    const groups = Array.isArray(sources && sources.groups) ? sources.groups : [];
+
+    const pushCandidate = (item) => {
+      const href = String(item && item.url || '').trim();
+      if (!href || seen.has(href)) return;
+      seen.add(href);
+      const hostname = getSourceHostname(href);
+      const label = normalizeSourceText(item && item.title || '') || hostname || href;
+      const preview = normalizeSourceText(item && item.preview || '');
+      candidates.push({ href, hostname, label, preview });
+    };
+
+    citations.forEach(pushCandidate);
+    groups.forEach((group) => {
+      const results = Array.isArray(group && group.results) ? group.results : [];
+      results.forEach(pushCandidate);
+    });
+
+    return candidates;
+  }
+
+  function extractCitationTerms(value) {
+    return (String(value || '').toLowerCase().match(/[a-z0-9][a-z0-9.-]{2,}|[\u4e00-\u9fff]{2,}/g) || [])
+      .map((term) => term.trim())
+      .filter((term) => term && !/^(模型|图片|图像|生成|支持|能力|介绍|版本|官方|页面|blog)$/.test(term));
+  }
+
+  function scoreSourceForText(text, candidate) {
+    const haystack = normalizeSourceText(text || '').toLowerCase();
+    if (!haystack) return 0;
+    const terms = [
+      ...extractCitationTerms(candidate && candidate.label || ''),
+      ...extractCitationTerms(candidate && candidate.preview || '')
+    ];
+    let score = 0;
+    const seen = new Set();
+    terms.forEach((term) => {
+      if (!term || seen.has(term)) return;
+      seen.add(term);
+      if (haystack.includes(term)) {
+        score += term.length >= 6 ? 3 : 2;
+      }
+    });
+    const hostname = String(candidate && candidate.hostname || '').toLowerCase();
+    if (hostname && haystack.includes(hostname.replace(/\.[a-z]+$/, ''))) {
+      score += 2;
+    }
+    return score;
+  }
+
+  function buildStructuredInlineCitationHtml(items) {
+    const group = Array.isArray(items) ? items.filter(Boolean) : [];
+    if (!group.length) return '';
+    return buildInlineCitationChip(group);
+  }
+
+  function applyStructuredInlineCitations(root, sources) {
+    if (!root || !sources || typeof sources !== 'object') return;
+    if (root.querySelector('.inline-citation-chip')) return;
+
+    const candidates = buildStructuredSourceCandidates(sources);
+    if (!candidates.length) return;
+
+    const blocks = Array.from(root.querySelectorAll('p, li'))
+      .filter((node) => node instanceof HTMLElement)
+      .filter((node) => !node.querySelector('.inline-citation-chip'))
+      .map((node) => ({ node, text: normalizeSourceText(node.textContent || '') }))
+      .filter((item) => item.text.length >= 24);
+
+    if (!blocks.length) return;
+
+    const used = new Set();
+    blocks.forEach(({ node, text }) => {
+      let best = null;
+      let bestScore = 0;
+      candidates.forEach((candidate) => {
+        if (used.has(candidate.href)) return;
+        const score = scoreSourceForText(text, candidate);
+        if (score > bestScore) {
+          bestScore = score;
+          best = candidate;
+        }
+      });
+      if (!best || bestScore < 2) return;
+      used.add(best.href);
+      const html = buildStructuredInlineCitationHtml([best]);
+      if (html) {
+        node.insertAdjacentHTML('beforeend', html);
+      }
+    });
+
+    if (!used.size) {
+      const fallback = blocks[0] && blocks[0].node;
+      const html = buildStructuredInlineCitationHtml([candidates[0]]);
+      if (fallback && html) {
+        fallback.insertAdjacentHTML('beforeend', html);
+      }
+    }
+  }
+
   function renderBasicMarkdown(rawText) {
     const text = (rawText || '').replace(/\\n/g, '\n');
-    const escaped = escapeHtml(text);
+    const htmlLinks = [];
+    const normalizedText = text
+      .replace(/<\/?span\b[^>]*>/gi, '')
+      .replace(/<a\b[^>]*href=(["'])(.*?)\1[^>]*>([\s\S]*?)<\/a>/gi, (match, quote, href, inner) => {
+        const label = String(inner || '')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/&nbsp;/gi, ' ')
+          .replace(/\s+/g, ' ')
+          .replace(/\u2060/g, '')
+          .trim();
+        const token = `@@HTMLLINK_${htmlLinks.length}@@`;
+        htmlLinks.push({
+          href: String(href || '').trim(),
+          label,
+          hostname: getSourceHostname(href)
+        });
+        return token;
+      });
+    const escaped = escapeHtml(normalizedText);
     const codeBlocks = [];
     const fenced = escaped.replace(/```([a-zA-Z0-9_-]+)?\n([\s\S]*?)```/g, (match, lang, code) => {
       const safeLang = lang ? escapeHtml(lang) : '';
@@ -594,7 +775,10 @@
       output = output.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, url) => {
         const safeAlt = escapeHtml(alt || 'image');
         const safeUrl = escapeHtml(url || '');
-        return `<img src="${safeUrl}" alt="${safeAlt}" loading="lazy">`;
+        const caption = safeAlt && safeAlt !== 'image'
+          ? `<figcaption class="message-image-caption">${safeAlt}</figcaption>`
+          : '';
+        return `<figure class="message-image-card"><img src="${safeUrl}" alt="${safeAlt}" loading="lazy">${caption}</figure>`;
       });
 
       output = output.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, label, url) => {
@@ -602,6 +786,8 @@
         const safeUrl = escapeHtml(url || '');
         return `<a href="${safeUrl}" target="_blank" rel="noopener">${safeLabel}</a>`;
       });
+
+      output = renderInlineCitationTokens(output, htmlLinks);
 
       return output;
     };
@@ -955,6 +1141,7 @@
       contentNode,
       role,
       raw: content || '',
+      sources: null,
       committed: false,
       startedAt: Date.now(),
       firstTokenAt: null,
@@ -1025,6 +1212,9 @@
       if (node.tagName === 'IMG') {
         return { items: [node], removeNode: null };
       }
+      if (node.tagName === 'FIGURE' && node.classList.contains('message-image-card')) {
+        return { items: [node], removeNode: null };
+      }
       if (isImageLink(node)) {
         return { items: [node], removeNode: null };
       }
@@ -1038,7 +1228,11 @@
             return null;
           }
           if (child.nodeType === Node.ELEMENT_NODE) {
-            if (child.tagName === 'IMG' || isImageLink(child)) {
+            if (
+              child.tagName === 'IMG' ||
+              isImageLink(child) ||
+              (child.tagName === 'FIGURE' && child.classList.contains('message-image-card'))
+            ) {
               items.push(child);
               continue;
             }
@@ -1254,6 +1448,9 @@
       updateThinkSummary(entry, entry.thinkElapsed);
     }
     if (entry.role === 'assistant' || entry.role === 'user') {
+      if (entry.role === 'assistant') {
+        applyStructuredInlineCitations(entry.contentNode, entry.sources);
+      }
       liftThinkImages(entry.contentNode);
       applyImageGrid(entry.contentNode);
       enhanceBrokenImages(entry.contentNode);
@@ -1327,6 +1524,285 @@
         block.setAttribute('data-thinking', 'true');
       }
     });
+  }
+
+  function normalizeSourceText(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function getSourceHostname(url) {
+    try {
+      return new URL(url).hostname.replace(/^www\./i, '');
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function getSourceFavicon(hostname) {
+    if (!hostname) return '';
+    return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(hostname)}&sz=256`;
+  }
+
+  function cleanExtractedUrl(url) {
+    return String(url || '').trim().replace(/[),.;]+$/g, '');
+  }
+
+  function extractUrlsFromText(text) {
+    const raw = String(text || '');
+    const matches = raw.match(/https?:\/\/[^\s"'<>]+/g) || [];
+    return matches.map(cleanExtractedUrl).filter((url) => /^https?:\/\//i.test(url));
+  }
+
+  function extractAssistantSources(root) {
+    if (!root || !root.querySelectorAll) {
+      return { links: [], searches: [] };
+    }
+    const rows = Array.from(root.querySelectorAll('.think-item-row'));
+    const links = [];
+    const searches = [];
+    const seenLinks = new Set();
+    const seenSearches = new Set();
+
+    const pushLink = (item) => {
+      const url = String(item && item.url || '').trim();
+      if (!url || seenLinks.has(url)) return;
+      seenLinks.add(url);
+      links.push(item);
+    };
+
+    const pushSearch = (item) => {
+      const label = String(item && item.label || '').trim();
+      if (!label || seenSearches.has(label)) return;
+      seenSearches.add(label);
+      searches.push(item);
+    };
+
+    rows.forEach((row) => {
+      const typeNode = row.querySelector('.think-item-type');
+      const bodyNode = row.querySelector('.think-item-body');
+      const type = String(typeNode && typeNode.dataset && typeNode.dataset.type || '').trim().toLowerCase();
+      if (!bodyNode || !type) return;
+
+      if (type === 'websearch' || type === 'searchimage') {
+        const firstParagraph = bodyNode.querySelector('p');
+        const queryText = normalizeSourceText(firstParagraph ? firstParagraph.textContent : bodyNode.textContent || '');
+        const compactQuery = queryText.split(/\s{2,}|\n/)[0].slice(0, 140).trim();
+        if (compactQuery) {
+          pushSearch({
+            type: 'search',
+            label: compactQuery,
+            meta: type === 'searchimage' ? '已搜索图片' : '已搜索的网络'
+          });
+        }
+      }
+
+      const links = Array.from(bodyNode.querySelectorAll('a[href]'));
+      links.forEach((link) => {
+        const url = String(link.getAttribute('href') || '').trim();
+        if (!/^https?:\/\//i.test(url)) return;
+        const hostname = getSourceHostname(url);
+        pushLink({
+          type: 'visit',
+          label: hostname || url,
+          meta: '已浏览',
+          url,
+          hostname
+        });
+      });
+
+      extractUrlsFromText(bodyNode.textContent || '').forEach((url) => {
+        const hostname = getSourceHostname(url);
+        pushLink({
+          type: 'visit',
+          label: hostname || url,
+          meta: '已浏览',
+          url,
+          hostname
+        });
+      });
+    });
+
+    return { links, searches };
+  }
+
+  function createSourcesWidget(entry) {
+    const structured = entry && entry.sources && typeof entry.sources === 'object' ? entry.sources : null;
+    const groups = Array.isArray(structured && structured.groups) ? structured.groups : [];
+    const citations = Array.isArray(structured && structured.citations) ? structured.citations : [];
+    const data = (!groups.length && !citations.length)
+      ? extractAssistantSources(entry && entry.contentNode)
+      : { links: [], searches: [] };
+    const sources = Array.isArray(data && data.links) ? data.links.slice() : [];
+    const searches = Array.isArray(data && data.searches) ? data.searches.slice() : [];
+    const seenLinks = new Set(sources.map((item) => String(item && item.url || '').trim()).filter(Boolean));
+
+    citations.forEach((item) => {
+      const url = String(item && item.url || '').trim();
+      if (!url || seenLinks.has(url)) return;
+      const hostname = getSourceHostname(url);
+      seenLinks.add(url);
+      sources.unshift({
+        type: 'citation',
+        label: hostname || url,
+        meta: '引用来源',
+        url,
+        hostname
+      });
+    });
+
+    groups.forEach((group) => {
+      const query = normalizeSourceText(group && group.query || '');
+      if (query) {
+        searches.push({
+          type: 'search',
+          label: query,
+          meta: group.kind === 'search_images' ? '图片搜索' : '网络搜索'
+        });
+      }
+      const results = Array.isArray(group && group.results) ? group.results : [];
+      results.forEach((item) => {
+        const url = String(item && item.url || '').trim();
+        if (!url || seenLinks.has(url)) return;
+        const hostname = getSourceHostname(url);
+        seenLinks.add(url);
+        sources.push({
+          type: 'visit',
+          label: normalizeSourceText(item && item.title || '') || hostname || url,
+          meta: hostname || '搜索结果',
+          url,
+          hostname
+        });
+      });
+    });
+
+    if (!sources.length && !searches.length) return null;
+
+    const wrapper = document.createElement('details');
+    wrapper.className = 'sources-widget';
+
+    const summary = document.createElement('summary');
+    summary.className = 'sources-chip';
+    const summaryCount = sources.length || searches.length;
+    const summaryLabel = sources.length ? `${summaryCount} sources` : `${summaryCount} searches`;
+    summary.setAttribute('aria-label', summaryLabel);
+
+    const iconStack = document.createElement('div');
+    iconStack.className = 'sources-icons';
+    const faviconHosts = [];
+    sources.forEach((item) => {
+      if (item.hostname && !faviconHosts.includes(item.hostname)) {
+        faviconHosts.push(item.hostname);
+      }
+    });
+    faviconHosts.slice(0, 3).forEach((hostname, index) => {
+      const badge = document.createElement('div');
+      badge.className = 'sources-icon-badge';
+      badge.style.zIndex = String(3 - index);
+      const img = document.createElement('img');
+      img.src = getSourceFavicon(hostname);
+      img.alt = '';
+      img.setAttribute('role', 'presentation');
+      badge.appendChild(img);
+      iconStack.appendChild(badge);
+    });
+    if (!iconStack.childNodes.length) {
+      const fallback = document.createElement('div');
+      fallback.className = 'sources-icon-fallback';
+      fallback.textContent = 'S';
+      iconStack.appendChild(fallback);
+    }
+    summary.appendChild(iconStack);
+
+    const label = document.createElement('div');
+    label.className = 'sources-chip-label';
+    label.textContent = summaryLabel;
+    summary.appendChild(label);
+
+    const panel = document.createElement('div');
+    panel.className = 'sources-panel';
+
+    if (sources.length) {
+      const title = document.createElement('div');
+      title.className = 'sources-section-title';
+      title.textContent = '可验证来源';
+      panel.appendChild(title);
+    }
+
+    sources.forEach((item) => {
+      const row = document.createElement(item.url ? 'a' : 'div');
+      row.className = 'source-row';
+      if (item.url) {
+        row.href = item.url;
+        row.target = '_blank';
+        row.rel = 'noopener noreferrer nofollow';
+      }
+
+      const icon = document.createElement('div');
+      icon.className = 'source-row-icon';
+      if (item.hostname) {
+        const img = document.createElement('img');
+        img.src = getSourceFavicon(item.hostname);
+        img.alt = '';
+        img.setAttribute('role', 'presentation');
+        icon.appendChild(img);
+      } else {
+        icon.textContent = item.type === 'search' ? 'Q' : 'L';
+      }
+
+      const textWrap = document.createElement('div');
+      textWrap.className = 'source-row-text';
+
+      const meta = document.createElement('span');
+      meta.className = 'source-row-meta';
+      meta.textContent = item.meta || '来源';
+
+      const title = document.createElement('span');
+      title.className = 'source-row-title';
+      title.textContent = item.label || item.url || '';
+
+      textWrap.appendChild(meta);
+      textWrap.appendChild(title);
+      row.appendChild(icon);
+      row.appendChild(textWrap);
+      panel.appendChild(row);
+    });
+
+    if (searches.length) {
+      const title = document.createElement('div');
+      title.className = 'sources-section-title';
+      title.textContent = '搜索轨迹';
+      panel.appendChild(title);
+    }
+
+    searches.forEach((item) => {
+      const row = document.createElement('div');
+      row.className = 'source-row is-query';
+
+      const icon = document.createElement('div');
+      icon.className = 'source-row-icon';
+      icon.textContent = 'Q';
+
+      const textWrap = document.createElement('div');
+      textWrap.className = 'source-row-text';
+
+      const meta = document.createElement('span');
+      meta.className = 'source-row-meta';
+      meta.textContent = item.meta || '搜索轨迹';
+
+      const title = document.createElement('span');
+      title.className = 'source-row-title';
+      title.textContent = item.label || '';
+
+      textWrap.appendChild(meta);
+      textWrap.appendChild(title);
+      row.appendChild(icon);
+      row.appendChild(textWrap);
+      panel.appendChild(row);
+    });
+
+    wrapper.appendChild(summary);
+    wrapper.appendChild(panel);
+    return wrapper;
   }
 
   function clearChat() {
@@ -1696,8 +2172,11 @@
 
   function attachAssistantActions(entry) {
     if (!entry || !entry.row) return;
+    const existing = entry.row.querySelector('.message-actions');
+    if (existing) existing.remove();
     const actions = document.createElement('div');
     actions.className = 'message-actions';
+    const sourcesWidget = createSourcesWidget(entry);
 
     const retryBtn = createActionButton('重试', '重试上一条回答', () => retryLast());
     const copyBtn = createActionButton('复制', '复制回答内容', () => copyToClipboard(entry.raw || ''));
@@ -1705,6 +2184,7 @@
       window.open(feedbackUrl, '_blank', 'noopener');
     });
 
+    if (sourcesWidget) actions.appendChild(sourcesWidget);
     actions.appendChild(retryBtn);
     actions.appendChild(copyBtn);
     actions.appendChild(feedbackBtn);
@@ -1788,9 +2268,9 @@
         if (!assistantEntry.committed) {
           assistantEntry.committed = true;
           if (retrySessionId) {
-            commitToSession(retrySessionId, assistantEntry.raw || '');
+            commitToSession(retrySessionId, assistantEntry.raw || '', assistantEntry.sources);
           } else {
-            messageHistory.push({ role: 'assistant', content: assistantEntry.raw || '' });
+            messageHistory.push({ role: 'assistant', content: assistantEntry.raw || '', sources: assistantEntry.sources || null });
           }
         }
         setStatus('error', '已中止');
@@ -1883,9 +2363,9 @@
         if (!assistantEntry.committed) {
           assistantEntry.committed = true;
           if (sendSessionId) {
-            commitToSession(sendSessionId, assistantEntry.raw || '');
+            commitToSession(sendSessionId, assistantEntry.raw || '', assistantEntry.sources);
           } else {
-            messageHistory.push({ role: 'assistant', content: assistantEntry.raw || '' });
+            messageHistory.push({ role: 'assistant', content: assistantEntry.raw || '', sources: assistantEntry.sources || null });
           }
         }
       } else {
@@ -1900,11 +2380,15 @@
     }
   }
 
-  function commitToSession(sessionId, assistantText) {
+  function commitToSession(sessionId, assistantText, assistantSources = null) {
     if (!sessionId || !sessionsData) return;
     const session = sessionsData.sessions.find((s) => s.id === sessionId);
     if (!session) return;
-    session.messages.push({ role: 'assistant', content: assistantText });
+    session.messages.push({
+      role: 'assistant',
+      content: assistantText,
+      sources: assistantSources || null
+    });
     if (session.messages.length > MAX_CONTEXT_MESSAGES) {
       session.messages = session.messages.slice(-MAX_CONTEXT_MESSAGES);
     }
@@ -1948,14 +2432,23 @@
             }
             assistantEntry.committed = true;
             if (targetSessionId) {
-              commitToSession(targetSessionId, assistantText);
+              commitToSession(targetSessionId, assistantText, assistantEntry.sources);
             } else {
-              messageHistory.push({ role: 'assistant', content: assistantText });
+              messageHistory.push({ role: 'assistant', content: assistantText, sources: assistantEntry.sources || null });
             }
             return;
           }
           try {
             const json = JSON.parse(payload);
+            if (json && json.sources && typeof json.sources === 'object') {
+              assistantEntry.sources = json.sources;
+              if (assistantEntry.contentNode) {
+                applyStructuredInlineCitations(assistantEntry.contentNode, assistantEntry.sources);
+              }
+              if (assistantEntry.row && assistantEntry.row.querySelector('.message-actions')) {
+                attachAssistantActions(assistantEntry);
+              }
+            }
             const delta = json && json.choices && json.choices[0] && json.choices[0].delta
               ? json.choices[0].delta.content
               : '';
@@ -1986,9 +2479,9 @@
     }
     assistantEntry.committed = true;
     if (targetSessionId) {
-      commitToSession(targetSessionId, assistantText);
+      commitToSession(targetSessionId, assistantText, assistantEntry.sources);
     } else {
-      messageHistory.push({ role: 'assistant', content: assistantText });
+      messageHistory.push({ role: 'assistant', content: assistantText, sources: assistantEntry.sources || null });
     }
     } finally {
       activeStreamInfo = null;
